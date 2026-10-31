@@ -1,65 +1,70 @@
-from nonebot import on_command, on_regex
-from nonebot.adapters.onebot.v11 import Bot
-from nonebot.adapters.onebot.v11.event import GroupMessageEvent, MessageEvent
+"""塔罗牌占卜插件(QQ 官方 Bot 版)。
+
+改自 MinatoAquaCrews/nonebot_plugin_tarot(MIT)。
+
+命令:
+- 占卜: 随机牌阵抽多张, 文本 + 横向拼图(单条合成图, 规避官方被动消息 5 条限制)
+- 塔罗牌: 单张抽牌回应
+
+官方群聊需 @机器人 触发; C2C 直接发送。均为被动回复, 不占主动消息额度。
+"""
+
+from __future__ import annotations
+
+from nonebot import on_command
+from nonebot.adapters import Event
+from nonebot.adapters.qq import Message, MessageSegment
 from nonebot.matcher import Matcher
-from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
 
 from .data_source import tarot_manager
 
-__tarot_version__ = "v0.4.0.post4"
-__tarot_usages__ = f'''
-塔罗牌 {__tarot_version__}
-[占卜] 随机选取牌阵进行占卜
-[塔罗牌] 得到单张塔罗牌回应
-[开启/启用/关闭/禁用]群聊转发 开启或关闭全局群聊转发'''.strip()
+__version__ = "1.0.0"
 
 __plugin_meta__ = PluginMetadata(
     name="塔罗牌",
-    description="塔罗牌！魔法占卜🔮",
-    usage=__tarot_usages__,
-    extra={
-        "author": "KafCoppelia <k740677208@gmail.com>",
-        "version": __tarot_version__
-    }
+    description="塔罗牌！魔法占卜🔮(QQ 官方 Bot 版, 牌图内置)",
+    usage=(
+        "占卜 —— 随机牌阵占卜(文本+拼图)\n"
+        "塔罗牌 —— 单张抽牌回应\n"
+        "官方群聊请 @机器人 触发"
+    ),
+    type="application",
+    homepage="https://github.com/MinatoAquaCrews/nonebot_plugin_tarot",
+    supported_adapters={"QQ"},
 )
 
-divine = on_command(cmd="占卜", priority=7)
-tarot = on_command(cmd="塔罗牌", priority=7)
-chain_reply_switch = on_regex(
-    pattern=r"^(开启|启用|关闭|禁用)群聊转发(模式)?$", permission=SUPERUSER, priority=7, block=True)
+divine = on_command("占卜", priority=7, block=True)
+tarot = on_command("塔罗牌", priority=7, block=True)
+
+
+async def _send_result(matcher: Matcher, event: Event, text: str, image: bytes | None) -> None:
+    """先发文本, 再发图(两条被动回复, 稳于图文同条)。无图时只发文本。"""
+    await matcher.send(text)
+    if image is None:
+        return
+    try:
+        await matcher.finish(Message([MessageSegment.file_image(image, file_name="tarot.png")]))
+    except Exception as exc:
+        # 富媒体上传失败不影响文字结果
+        from nonebot.log import logger
+
+        logger.warning(f"塔罗牌图片上传失败: {exc}")
 
 
 @divine.handle()
-async def general_divine(bot: Bot, matcher: Matcher, event: MessageEvent):
-    arg: str = event.get_plaintext()
-
+async def handle_divine(matcher: Matcher, event: Event) -> None:
+    arg = event.get_plaintext()
     if "帮助" in arg[-2:]:
-        await matcher.finish(__tarot_usages__)
-
-    await tarot_manager.divine(bot, matcher, event)
+        await matcher.finish(__plugin_meta__.usage)
+    text, image = await tarot_manager.draw_formation()
+    await _send_result(matcher, event, text, image)
 
 
 @tarot.handle()
-async def _(matcher: Matcher, event: MessageEvent):
-    arg: str = event.get_plaintext()
-
+async def handle_tarot(matcher: Matcher, event: Event) -> None:
+    arg = event.get_plaintext()
     if "帮助" in arg[-2:]:
-        await matcher.finish(__tarot_usages__)
-
-    msg = await tarot_manager.onetime_divine()
-    await matcher.finish(msg)
-
-
-@chain_reply_switch.handle()
-async def _(event: GroupMessageEvent):
-    arg: str = event.get_plaintext()
-
-    if arg[:2] == "开启" or arg[:2] == "启用":
-        tarot_manager.switch_chain_reply(True)
-        msg = "占卜群聊转发模式已开启~"
-    else:
-        tarot_manager.switch_chain_reply(False)
-        msg = "占卜群聊转发模式已关闭~"
-
-    await chain_reply_switch.finish(msg)
+        await matcher.finish(__plugin_meta__.usage)
+    text, image = await tarot_manager.draw_single()
+    await _send_result(matcher, event, text, image)

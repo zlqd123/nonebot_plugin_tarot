@@ -110,3 +110,13 @@ _“许多傻瓜对千奇百怪的迷信说法深信不疑：象牙、护身符�
 1. [真寻bot插件库/tarot](https://github.com/AkashiCoin/nonebot_plugins_zhenxun_bot)
 
 2. [haha114514/tarot_hoshino](https://github.com/haha114514/tarot_hoshino)
+
+## QQ 官方 Bot 适配版（`qqbot` 分支）
+
+本分支为 QQ 官方 Bot（adapter-qq / openid 体系）适配版，改动：
+
+- 图片资源**本地内置**（BilibiliTarot 主题），移除运行时 GitHub 下载与更新逻辑（原实现的故障源）
+- 多张牌**横向拼成一张合成图**（逆位自动旋转 180°，底部标注牌名与正逆位），单条回复发送，规避官方 Bot 被动消息 5 分钟/5 条限制；移除 OB11 合并转发及其开关命令
+- 发送层与适配器解耦，`data_source` 只产出 `(文本, 图片 bytes)`，由入口层用 `MessageSegment.file_image` 发送（自动走官方媒体上传）
+- `tarot.json` 升级到 v1.3：修正时间之流/马蹄/平安扇/沙迪若之星的位次与张数错误，去掉六芒星、五牌阵的错误切牌标记，新增**凯尔特十字阵**（10 张）
+- 命令不变：`占卜` / `塔罗牌`（官方群聊需 @机器人）

@@ -1,236 +1,152 @@
-import asyncio
+"""塔罗牌数据与渲染(QQ 官方 Bot 版)。
+
+改自 MinatoAquaCrews/nonebot_plugin_tarot(MIT), 主要变化:
+- tarot.json 内置, 不再运行时从 GitHub 更新
+- 图片资源本地内置(BilibiliTarot 主题), 不再在线拉取
+- 多张牌拼成一张合成图, 规避官方 Bot 被动消息 5 分钟/5 条限制
+  (原版逐张发送 + OB11 合并转发在官方通道均不可用)
+- 发送层与适配器解耦, 只产出 (文本, 图片bytes), 由 __init__ 决定怎么发
+"""
+
+from __future__ import annotations
+
+import json
 import random
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
 
-from nonebot.adapters.onebot.v11 import Bot, MessageSegment
-from nonebot.adapters.onebot.v11.event import (GroupMessageEvent, MessageEvent,
-                                               PrivateMessageEvent)
-from nonebot.matcher import Matcher
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
-from .config import EventNotSupport, ResourceError, get_tarot, tarot_config
+#: 内置资源: 牌阵与 78 张牌的文本数据
+JSON_PATH = Path(__file__).parent / "tarot.json"
+#: 卡图目录(按 type 分子目录, 文件名 = json 的 pic 字段)
+RESOURCE_DIR = Path(__file__).parent / "resource" / "BilibiliTarot"
+#: 合成图上标注牌名用的字体(思源黑体, 与 xibao 同源)
+FONT_PATH = Path(__file__).parent / "SourceHanSansSC-Regular.otf"
 
-try:
-    import ujson as json
-except ModuleNotFoundError:
-    import json
-
-
-def chain_reply(bot: Bot,
-                chain: List[Dict[str, Union[str, Dict[str, Union[str, MessageSegment]]]]],
-                msg: MessageSegment
-                ) -> List[Dict[str, Union[str, Dict[str, Union[str, MessageSegment]]]]]:
-    data = {
-        "type": "node",
-        "data": {
-            "name": list(tarot_config.nickname)[0],
-            "uin": bot.self_id,
-            "content": msg
-        },
-    }
-    chain.append(data)
-    return chain
+#: 合成图参数: 单张目标高度 / 间距 / 标注区高度
+_CARD_TARGET_H = 560
+_PAD = 24
+_LABEL_H = 64
+_BG_COLOR = (248, 244, 235)
+_LABEL_COLOR = (70, 55, 40)
 
 
-def pick_theme() -> str:
-    '''
-        Random choose a theme from the union of local & official themes
-    '''
-    sub_themes_dir: List[str] = [
-        f.name for f in tarot_config.tarot_path.iterdir() if f.is_dir()]
+class TarotManager:
+    """塔罗牌抽取与合成图渲染。"""
 
-    if len(sub_themes_dir) > 0:
-        return random.choice(list(set(sub_themes_dir).union(tarot_config.tarot_official_themes)))
+    def __init__(self) -> None:
+        with JSON_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.cards: dict[str, dict] = data["cards"]
+        self.formations: dict[str, dict] = data["formations"]
 
-    return random.choice(tarot_config.tarot_official_themes)
+    # ------------------------------------------------------------------ 抽牌
 
+    def _pick_cards(self, num: int) -> list[dict]:
+        return random.sample(list(self.cards.values()), num)
 
-def pick_sub_types(theme: str) -> List[str]:
-    '''
-        Random choose a sub type of the "theme".
-        If it is in official themes, all the sub types are available.
-    '''
-    all_sub_types: List[str] = ["MajorArcana",
-                                "Cups", "Pentacles", "Sowrds", "Wands"]
+    def _load_card_image(self, card: dict) -> Image.Image | None:
+        """按 json 的 pic 字段在本地资源目录找卡图; 找不到返回 None(纯文字退化)。"""
+        img_dir = RESOURCE_DIR / str(card.get("type") or "")
+        if not img_dir.is_dir():
+            return None
+        for p in img_dir.glob(str(card.get("pic") or "\0") + ".*"):
+            try:
+                return Image.open(p).convert("RGB")
+            except OSError:
+                continue
+        return None
 
-    if theme == "BilibiliTarot":
-        return all_sub_types
+    def _flip(self, card: dict) -> bool:
+        """随机正/逆位: True=正位。"""
+        return random.random() < 0.5
 
-    if theme == "TouhouTarot":
-        return ["MajorArcana"]
+    # ------------------------------------------------------------------ 占卜入口
 
-    sub_types: List[str] = [f.name for f in (
-        tarot_config.tarot_path / theme).iterdir() if f.is_dir() and f.name in all_sub_types]
-
-    return sub_types
-
-
-class Tarot:
-    def __init__(self):
-        self.tarot_json: Path = Path(__file__).parent / "tarot.json"
-        self.is_chain_reply: bool = tarot_config.chain_reply
-
-    async def divine(self, bot: Bot, matcher: Matcher, event: MessageEvent) -> None:
-        '''
-            General tarot devination.
-            1. Choose a theme
-            2. Open tarot.json and Random choose a formation
-            3. Get the devined cards list and their text
-            4. Generate message (or chain reply if enabled)
-        '''
-        # 1. Pick a theme randomly
-        theme: str = pick_theme()
-
-        with open(self.tarot_json, 'r', encoding='utf-8') as f:
-            content = json.load(f)
-            all_cards = content.get("cards")
-            all_formations = content.get("formations")
-
-            formation_name = random.choice(list(all_formations))
-            formation = all_formations.get(formation_name)
-
-        await matcher.send(f"启用{formation_name}，正在洗牌中")
-
-        # 2. Get cards of "cards_num"
-        cards_num: int = formation.get("cards_num")
-        cards_info_list = self._random_cards(all_cards, theme, cards_num)
-
-        # 3. Get the text of representations
-        is_cut: bool = formation.get("is_cut")
-        representations: List[Union[str, List[str]]] = random.choice(
-            formation.get("representations"))
-
-        # 4. Genrate message
-        chain = []
-        for i in range(cards_num):
-            # Select the #i tarot
-            if is_cut and i == cards_num - 1:
-                msg_header = MessageSegment.text(f"切牌「{representations[i]}」\n")
-            else:
-                msg_header = MessageSegment.text(
-                    f"第{i+1}张牌「{representations[i]}」\n")
-
-            flag, msg_body = await self._get_text_and_image(theme, cards_info_list[i])
-            if not flag:
-                await matcher.finish(msg_body)
-
-            if isinstance(event, PrivateMessageEvent):
-                if i < cards_num:
-                    await matcher.send(msg_header + msg_body)
-                else:
-                    await matcher.finish(msg_header + msg_body)
-
-            elif isinstance(event, GroupMessageEvent):
-                if self.is_chain_reply:
-                    chain = chain_reply(bot, chain, msg_header + msg_body)
-                else:
-                    if i < cards_num - 1:
-                        await matcher.send(msg_header + msg_body)
-                        await asyncio.sleep(1)  # In case of frequency sending
-                    else:
-                        await matcher.finish(msg_header + msg_body)
-            else:
-                raise EventNotSupport
-
-        if self.is_chain_reply:
-            await bot.send_group_forward_msg(group_id=event.group_id, messages=chain)
-
-    async def onetime_divine(self) -> MessageSegment:
-        '''
-            One-time divination.
-        '''
-        # 1. Pick a theme randomly
-        theme: str = pick_theme()
-
-        # 2. Get one card ONLY
-        with open(self.tarot_json, 'r', encoding='utf-8') as f:
-            content = json.load(f)
-            all_cards = content.get("cards")
-            card_info_list = self._random_cards(all_cards, theme)
-
-        # 3. Get the text and image
-        flag, body = await self._get_text_and_image(theme, card_info_list[0])
-
-        return "回应是" + body if flag else body
-
-    def switch_chain_reply(self, new_state: bool) -> None:
-        '''
-            开启/关闭全局群聊转发模式
-        '''
-        self.is_chain_reply = new_state
-
-    def _random_cards(self,
-                      all_cards: Dict[str, Dict[str, Dict[str, Union[str, Dict[str, str]]]]],
-                      theme: str,
-                      num: int = 1
-                      ) -> List[Dict[str, Union[str, Dict[str, str]]]]:
-        '''
-            Iterate the sub directory, get the subset of cards
-        '''
-        sub_types: List[str] = pick_sub_types(theme)
-
-        if len(sub_types) < 1:
-            raise ResourceError(f"本地塔罗牌主题 {theme} 为空！请检查资源！")
-
-        subset: Dict[str, Dict[str, Union[str, Dict[str, str]]]] = {
-            k: v for k, v in all_cards.items() if v.get("type") in sub_types
-        }
-
-        # 2. Random sample the cards according to the num
-        cards_index: List[str] = random.sample(list(subset), num)
-        cards_info: List[Dict[str, Union[str, Dict[str, str]]]] = [
-            v for k, v in subset.items() if k in cards_index]
-
-        return cards_info
-
-    async def _get_text_and_image(self,
-                                  theme: str,
-                                  card_info: Dict[str,
-                                                  Union[str, Dict[str, str]]]
-                                  ) -> Tuple[bool, MessageSegment]:
-        '''
-            Get a tarot image & text arrcording to the "card_info"
-        '''
-        _type: str = card_info.get("type")
-        _name: str = card_info.get("pic")
-        img_name: str = ""
-        img_dir: Path = tarot_config.tarot_path / theme / _type
-
-        # Consider the suffix of pictures
-        for p in img_dir.glob(_name + ".*"):
-            img_name = p.name
-
-        if img_name == "":
-            if theme in tarot_config.tarot_official_themes:
-                data = await get_tarot(theme, _type, _name)
-                if data is None:
-                    return False, MessageSegment.text("图片下载出错，请重试或将资源部署本地……")
-
-                img: Image.Image = Image.open(BytesIO(data))
-            else:
-                # In user's theme, then raise ResourceError
-                raise ResourceError(
-                    f"Tarot image {theme}/{_type}/{_name} doesn't exist! Make sure the type {_type} is complete.")
-        else:
-            img: Image.Image = Image.open(img_dir / img_name)
-
-        # 3. Choose up or down
-        name_cn: str = card_info.get("name_cn")
-        if random.random() < 0.5:
-            # 正位
-            meaning: str = card_info.get("meaning").get("up")
-            msg = MessageSegment.text(f"「{name_cn}正位」「{meaning}」\n")
-        else:
-            meaning: str = card_info.get("meaning").get("down")
-            msg = MessageSegment.text(f"「{name_cn}逆位」「{meaning}」\n")
+    async def draw_single(self) -> tuple[str, bytes | None]:
+        """单张抽牌(塔罗牌命令): 返回 (文本, 卡图bytes 或 None)。"""
+        card = self._pick_cards(1)[0]
+        up = self._flip(card)
+        meaning = card["meaning"]["up" if up else "down"]
+        pos = "正位" if up else "逆位"
+        text = f"回应是「{card['name_cn']}{pos}」({card['name_en']})\n{meaning}"
+        img = self._load_card_image(card)
+        if img is not None and not up:
             img = img.rotate(180)
+        return text, self._img_bytes(img) if img is not None else None
 
+    async def draw_formation(self) -> tuple[str, bytes | None]:
+        """牌阵占卜(占卜命令): 随机牌阵抽 N 张, 文本 + 横向拼图。"""
+        formation_name = random.choice(list(self.formations))
+        formation = self.formations[formation_name]
+        cards_num: int = formation["cards_num"]
+        is_cut: bool = formation["is_cut"]
+        representations = random.choice(formation["representations"])
+
+        cards = self._pick_cards(cards_num)
+        lines = [f"启用「{formation_name}」，正在洗牌中……"]
+        composed: list[tuple[Image.Image, str]] = []
+        for i, card in enumerate(cards):
+            up = self._flip(card)
+            meaning = card["meaning"]["up" if up else "down"]
+            pos = "正位" if up else "逆位"
+            label = str(representations[i]) if i < len(representations) else f"第{i + 1}张"
+            if is_cut and i == cards_num - 1:
+                header = f"切牌「{label}」"
+            else:
+                header = f"第{i + 1}张「{label}」"
+            lines.append(f"{header}：{card['name_cn']}{pos} —— {meaning}")
+
+            img = self._load_card_image(card)
+            if img is not None:
+                if not up:
+                    img = img.rotate(180)
+                composed.append((img, f"{card['name_cn']}{pos}"))
+
+        return "\n".join(lines), self._compose(composed) if composed else None
+
+    # ------------------------------------------------------------------ 渲染
+
+    @staticmethod
+    def _img_bytes(img: Image.Image) -> bytes:
         buf = BytesIO()
-        img.save(buf, format='png')
+        img.save(buf, format="PNG")
+        return buf.getvalue()
 
-        return True, msg + MessageSegment.image(buf)
+    def _compose(self, cards: list[tuple[Image.Image, str]]) -> bytes:
+        """把多张牌横向拼成一张图, 底部标注牌名与正逆位。"""
+        font: ImageFont.FreeTypeFont | None = None
+        if FONT_PATH.exists():
+            try:
+                font = ImageFont.truetype(str(FONT_PATH), 36)
+            except OSError:
+                font = None
+
+        scaled: list[tuple[Image.Image, str]] = []
+        for img, label in cards:
+            w = max(1, int(img.width * _CARD_TARGET_H / img.height))
+            scaled.append((img.resize((w, _CARD_TARGET_H)), label))
+
+        total_w = sum(img.width for img, _ in scaled) + _PAD * (len(scaled) + 1)
+        total_h = _PAD * 2 + _CARD_TARGET_H + _LABEL_H
+        canvas = Image.new("RGB", (total_w, total_h), _BG_COLOR)
+        draw = ImageDraw.Draw(canvas)
+
+        x = _PAD
+        for img, label in scaled:
+            canvas.paste(img, (x, _PAD))
+            if font is not None:
+                draw.text(
+                    (x + img.width // 2, _PAD + _CARD_TARGET_H + 10),
+                    label,
+                    fill=_LABEL_COLOR,
+                    font=font,
+                    anchor="ma",
+                )
+            x += img.width + _PAD
+
+        return self._img_bytes(canvas)
 
 
-tarot_manager = Tarot()
+tarot_manager = TarotManager()
